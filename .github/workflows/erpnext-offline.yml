@@ -1,0 +1,115 @@
+name: ERPNext offline package
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: erpnext-offline-package
+  cancel-in-progress: false
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      SOURCE_COMMIT: 48a34e5f1620c2f71253d70af21da14c9c931ea8
+      COMPOSE_SHA256: 2267652887d9df39ee2b60e281aa90c583bdcb5e931d21f60b5d18574f529243
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Fetch pinned official test configuration
+        run: |
+          set -euo pipefail
+          mkdir -p bundle
+          curl --fail --location --retry 3 --connect-timeout 20 --max-time 120 \
+            "https://raw.githubusercontent.com/frappe/frappe_docker/${SOURCE_COMMIT}/pwd.yml" \
+            --output bundle/pwd.upstream.yml
+          echo "${COMPOSE_SHA256}  bundle/pwd.upstream.yml" | sha256sum --check
+          docker compose -f bundle/pwd.upstream.yml config --quiet
+          docker compose -f bundle/pwd.upstream.yml config --images | sort -u > bundle/images.txt
+          printf '%s\n' 'frappe/erpnext:v16.36.1' 'mariadb:11.8' 'redis:6.2-alpine' | sort > expected-images.txt
+          diff -u expected-images.txt bundle/images.txt
+
+      - name: Download official Linux amd64 images
+        run: |
+          set -euo pipefail
+          while IFS= read -r image; do
+            success=false
+            for attempt in 1 2 3; do
+              if timeout 900 docker pull --platform linux/amd64 "$image"; then
+                success=true
+                break
+              fi
+              sleep 10
+            done
+            if [ "$success" != true ]; then
+              echo "::error::Failed to download $image"
+              exit 1
+            fi
+            architecture=$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$image")
+            test "$architecture" = linux/amd64
+          done < bundle/images.txt
+          mapfile -t images < bundle/images.txt
+          docker image inspect "${images[@]}" > bundle/image-inspect.json
+          docker image inspect --format '{{json .RepoTags}} {{json .RepoDigests}} {{.Id}}' \
+            "${images[@]}" > bundle/image-digests.txt
+
+      - name: Export images and import instructions
+        run: |
+          set -euo pipefail
+          mapfile -t images < bundle/images.txt
+          docker image save "${images[@]}" | gzip -1 > bundle/images.tar.gz
+          gzip --test bundle/images.tar.gz
+          printf '%s\n' \
+            "Source: https://github.com/frappe/frappe_docker" \
+            "Commit: ${SOURCE_COMMIT}" \
+            "Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            "Created (UTC): $(date -u +%FT%TZ)" \
+            'Platform: linux/amd64' > bundle/provenance.txt
+          cat > bundle/IMPORT-ONLY.txt <<'EOF'
+          This package contains public software images only. No business data is included.
+          It is a test package, not a production deployment.
+
+          After extracting the downloaded ZIP and transferring its contents into an
+          Ubuntu directory, open a terminal in that directory and run:
+
+            sha256sum -c SHA256SUMS
+            sudo docker load -i images.tar.gz
+            sudo docker image ls
+
+          STOP if any checksum fails. The import does not start the application.
+          pwd.upstream.yml is an unchanged upstream REFERENCE file. It contains demo
+          passwords and publishes port 8080 on all interfaces. Do not run it as-is.
+          Prepare the local deployment configuration before starting any services.
+          mariadb:11.8 and redis:6.2-alpine are moving upstream tags; the exact pulled
+          image IDs and repository digests are recorded in image-inspect.json and
+          image-digests.txt. Keep this bundle to reproduce this download.
+          EOF
+          cd bundle
+          sha256sum images.tar.gz images.txt image-inspect.json image-digests.txt \
+            pwd.upstream.yml provenance.txt IMPORT-ONLY.txt > SHA256SUMS
+          sha256sum --check SHA256SUMS
+
+      - name: Upload downloadable offline package
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: erpnext-v16.36.1-linux-amd64-offline
+          path: bundle/
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Show download instructions
+        run: |
+          {
+            echo '## Offline package is ready'
+            echo 'Download erpnext-v16.36.1-linux-amd64-offline from Artifacts on this run page.'
+            echo 'Retention: 1 day. Download promptly; the workflow can be run again if needed.'
+            echo 'Extract the ZIP, transfer to Ubuntu, and follow IMPORT-ONLY.txt.'
+            echo 'Image download/export completed. ERPNext application startup has NOT been tested.'
+            du -h bundle/images.tar.gz
+          } >> "$GITHUB_STEP_SUMMARY"
